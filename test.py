@@ -1,3 +1,8 @@
+import warnings
+# 放在最前面，屏蔽烦人的警告
+warnings.filterwarnings("ignore", category=UserWarning, module='gym')
+warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+
 import gymnasium as gym
 import numpy as np
 from stable_baselines3 import SAC
@@ -6,11 +11,11 @@ from custom_env import RLMealWrapper
 import matplotlib.pyplot as plt
 
 def magni_risk(bg):
-    """
-    计算 Magni Risk (论文公式 1) [cite: 126]
-    """
+  
     if bg <= 1: bg = 1
-    f_bg = 3.5506 * (np.log(bg)**0.8353) - 3.7932
+
+    f_bg = 3.5506 * ((np.log(bg)**0.8353) - 3.7932)
+    
     risk = 10 * (f_bg**2)
     return risk
 
@@ -26,20 +31,25 @@ def calculate_lbgi_hbgi(bg_array):
 
 def main():
     # --- 1. 设置参数 ---
-    model_path = "final_rl_meal_model" 
+    model_path = "logs/checkpoints/rl_meal_sac_2000000_steps" 
     # 论文中使用了 adult#006, adolescent#006, child#006 作为典型案例 
-    patient = 'adolescent#006'  
+    patient = 'adult#003'  
     
     # 论文设定：测试时长为 14 天 
-    # simglucose 默认采样通常为 3分钟(1天480步) 或 5分钟(1天288步)
-    # 无论哪种，我们通过模拟时长来控制最稳妥
     TEST_HORIZON_DAYS = 14 
     
     print(f"正在加载模型: {model_path} ...")
     print(f"创建仿真环境，病人: {patient}")
     
-    # 注意：这里需要重新实例化环境，确保和训练时一致
+    # --- 环境初始化 ---
     base_env = T1DSimEnv(patient_name=patient)
+    
+    # --- 关键修改：强制设置采样时间为 5 分钟 ---
+    # 这样一天就是 288 步 (24 * 12)
+    base_env.sample_time = 5
+    if hasattr(base_env, 'sensor'):
+        base_env.sensor.sample_time = 5
+        
     env = RLMealWrapper(base_env)
 
     try:
@@ -50,42 +60,51 @@ def main():
 
     # --- 2. 开始测试 ---
     obs, info = env.reset()
+    
+    # 有些旧版本的 simglucose reset 返回的是 tuple，有些是单个 obs
+    if isinstance(obs, tuple):
+        obs = obs[0]
+        
     done = False
     truncated = False
     
     bg_history = []
     risk_history = []
     
-    # 假设每步 3 分钟 (simglucose 默认)，14天 = 6720步
-    # 我们用 while 循环配合天数检查
-    current_day = 0
-    steps = 0
-    max_steps = 14 * 480 # 预估最大步数，用于进度条，实际由 env 时间决定
-
-    print(f"开始 14 天仿真测试...")
+    # 计算目标总步数：14天 * 24小时 * 12步/小时 (60/5)
+    total_steps_target = TEST_HORIZON_DAYS * 288
+    
+    print(f"开始 {TEST_HORIZON_DAYS} 天仿真测试 (目标步数: {total_steps_target})...")
 
     while not (done or truncated):
-        # 使用 deterministic=True 进行评估
+        # 使用 deterministic=True 进行评估，这是测试 RL 模型的标准做法
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, truncated, info = env.step(action)
+        
+        step_result = env.step(action)
+        
+        # 兼容不同 gym 版本的返回值解包
+        if len(step_result) == 5:
+            obs, reward, done, truncated, info = step_result
+        else:
+            obs, reward, done, info = step_result
+            truncated = False
         
         # 记录数据
+        # 优先从 info 获取真实 BG，如果没有则尝试从 observation 反推 (不推荐)
         if 'bg' in info:
             bg_val = info['bg']
-            bg_history.append(bg_val)
-            risk_history.append(magni_risk(bg_val))
+        elif hasattr(base_env, 'CGM_hist'):
+             bg_val = base_env.CGM_hist[-1]
+        else:
+             bg_val = 0 # Should not happen
+             
+        bg_history.append(bg_val)
+        risk_history.append(magni_risk(bg_val))
         
-        steps += 1
-        
-        # 检查是否达到 14 天 (20160 分钟)
-        # simglucose 的 info['time'] 是 datetime 对象，或者我们简单地用步数截断
-        # 这里为了简单直接用步数强制截断 (假设 3分钟一步)
-        if steps >= 14 * 288 * (5/3): # 粗略估算，或者直接跑满
-             # 更稳妥的方式是看 bg_history 的长度
-             # 实际上 simglucose 默认跑很久，我们手动 break 即可
-             if len(bg_history) >= 14 * 288: # 假设 5分钟间隔，14天数据量
-                 print("达到 14 天测试时长，停止测试。")
-                 break
+        # 检查是否达到目标天数
+        if len(bg_history) >= total_steps_target:
+             print(f"达到 {TEST_HORIZON_DAYS} 天测试时长，停止测试。")
+             break
 
     print("-" * 30)
     if len(bg_history) == 0:
@@ -99,14 +118,17 @@ def main():
     mean_risk = np.mean(risk_history)
     
     # B. TIR / Hypo / Hyper (论文核心指标)
+    # 正常范围: [70, 180]
     tir = np.sum((bg_array >= 70) & (bg_array <= 180)) / len(bg_array) * 100
+    # 低血糖: < 70
     hypo = np.sum(bg_array < 70) / len(bg_array) * 100
+    # 高血糖: > 180
     hyper = np.sum(bg_array > 180) / len(bg_array) * 100
     
     # C. LBGI / HBGI (辅助分析)
     lbgi, hbgi = calculate_lbgi_hbgi(bg_array)
 
-    print(f"测试结果 (Patient: {patient}, Days: 14)")
+    print(f"测试结果 (Patient: {patient}, Days: {TEST_HORIZON_DAYS})")
     print(f"总步数: {len(bg_array)}")
     print(f"平均血糖: {np.mean(bg_array):.2f} mg/dL")
     print("-" * 20)
@@ -120,15 +142,19 @@ def main():
 
     # --- 4. 绘图 ---
     plt.figure(figsize=(12, 6))
-    plt.plot(bg_history, label='Blood Glucose')
+    plt.plot(bg_history, label='Blood Glucose', linewidth=1)
     # 画出安全范围
     plt.axhline(y=180, color='r', linestyle='--', alpha=0.5, label='Hyper Limit (180)')
     plt.axhline(y=70, color='orange', linestyle='--', alpha=0.5, label='Hypo Limit (70)')
+    # 画出目标值参考线 (140)
+    plt.axhline(y=140, color='g', linestyle=':', alpha=0.3, label='Target (140)')
+    
     plt.title(f'14-Day Simulation: {patient}')
     plt.ylabel('BG (mg/dL)')
-    plt.xlabel('Steps')
+    plt.xlabel('Steps (5 min/step)')
     plt.legend()
     plt.grid(True, alpha=0.3)
+    plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
